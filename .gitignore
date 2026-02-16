@@ -1,0 +1,19 @@
+# Credentials
+.env
+
+# Python environment & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Operating System files
+.DS_Store
+Thumbs.db

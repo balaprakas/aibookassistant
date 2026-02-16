@@ -16,7 +16,6 @@ app.add_middleware(
 # --- 2. GEMINI CONFIG ---
 GEMINI_API_KEY = "AIzaSyDxJe22uh5V3cCFeOMlyQYd9-S9Q4f5oGI" 
 genai.configure(api_key=GEMINI_API_KEY)
-# Using your specified model
 model = genai.GenerativeModel('gemini-3-flash-preview')
 
 # --- 3. STORY DATA & IMAGE MAP ---
@@ -68,43 +67,41 @@ async def start_story():
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest):
-    # Fix: Ensure Gemini receives the current user input as part of the context immediately
-    updated_context = req.story_context + f" | Child said: {req.user_input}"
+    # 1. Update context immediately so Gemini sees the latest input
+    updated_context = req.story_context + f" Child: {req.user_input}."
     
     current_stage_data = STAGES.get(req.current_stage, STAGES[8])
     current_theme = current_stage_data["theme"]
     
-    # Logic: Dynamic nudge instruction based on turn count to avoid monotony
+    # 2. Define the Nudge Strategy based on turn count
     if req.stage_turn_count < 2:
-        nudge_instruction = "Focus purely on play and brainstorming. Do NOT mention writing or the template."
+        nudge_instruction = "Just be a playful friend and brainstorm. Don't mention the template yet."
     elif req.stage_turn_count == 2:
-        nudge_instruction = "Give a natural nudge like: 'That belongs in your book! Want to add it to your page?'"
+        nudge_instruction = "Give a gentle nudge like: 'That would look so cool on your storybook page! Do you want to write that bit down?'"
     else:
-        nudge_instruction = "Acknowledge their great work and guide them toward the next part of the story."
+        nudge_instruction = "Tell them they've done a great job on this page and ask if they're ready to see what happens next in the story."
 
     prompt = f"""
-    You are 'Story Buddy', a magical co-author. 
+    You are 'Story Buddy', a co-author. 
+    CURRENT TASK: {current_theme}
+    TURNS TAKEN: {req.stage_turn_count}/4
     
-    IMPORTANT: The child just said: "{req.user_input}". 
-    You MUST respond specifically to that detail first.
+    YOUR INSTRUCTION: {nudge_instruction}
 
-    STORY PROGRESS:
-    - Context: {updated_context}
-    - Current Scene: {current_theme}
-    - Turn count: {req.stage_turn_count}/4
-
-    DIRECTIONS:
-    - {nudge_instruction}
-    - Keep responses to 2 sentences.
-    - Start directly with dialogue. NEVER use prefixes like 'HAPPY:' or '(SURPRISED)'.
-    - If turns < 4, use [STAY]. If turns >= 4, use [ADVANCE].
+    RULES:
+    1. Acknowledge the child's last message: "{req.user_input}" immediately.
+    2. Be brief (2-3 sentences).
+    3. Use [ADVANCE] only if they are done or at Turn 4. Use [STAY] otherwise.
+    4. NO EMOTION PREFIXES (e.g., do not start with 'HAPPY:').
+    
+    STORY SO FAR: {updated_context}
     """
 
     try:
         response = model.generate_content(prompt)
         raw_response = response.text
         
-        # Advance Logic
+        # --- Logic: Advance Triggers ---
         button_done = "i have finished writing this part in my template" in req.user_input.lower()
         turn_limit_reached = req.stage_turn_count >= 4
         ai_wants_advance = "[ADVANCE]" in raw_response
@@ -114,16 +111,10 @@ async def chat_endpoint(req: ChatRequest):
         if new_stage > 8: new_stage = 8
         new_turn_count = 0 if should_advance else req.stage_turn_count + 1
 
-        # Extract Emotion
-        detected_emotion = "HAPPY"
-        for e in ["SURPRISED", "THINKING", "SAD"]:
-            if e in raw_response.upper(): detected_emotion = e
-
-        # Final string cleaning to remove technical tags and emotion prefixes
+        # --- Clean Output ---
         clean_reply = raw_response.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
-        
-        prefixes_to_clean = ["HAPPY:", "SURPRISED:", "THINKING:", "SAD:", "(HAPPY)", "(SURPRISED)", "STORY BUDDY:"]
-        for p in prefixes_to_clean:
+        # Remove any lingering "Emotion:" prefixes
+        for p in ["HAPPY:", "SURPRISED:", "THINKING:", "SAD:"]:
             if clean_reply.upper().startswith(p):
                 clean_reply = clean_reply[len(p):].strip()
 
@@ -133,10 +124,10 @@ async def chat_endpoint(req: ChatRequest):
             "stage_turn_count": new_turn_count,
             "story_context": updated_context,
             "action": "ADVANCE" if should_advance else "STAY",
-            "emotion": detected_emotion,
+            "emotion": "HAPPY", # You can keep logic to detect this if needed
             "image_url": IMAGE_MAP.get(new_stage, IMAGE_MAP[8])
         }
 
     except Exception as e:
         print(f"Error: {e}")
-        raise HTTPException(status_code=500, detail="Story Buddy got a bit confused! Try again.")
+        raise HTTPException(status_code=500, detail="The Story Buddy is thinking...")
