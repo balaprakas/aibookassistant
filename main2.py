@@ -12,7 +12,9 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
+
 app = FastAPI()
 
 # --- 1. CONFIGURATION ---
@@ -26,16 +28,19 @@ ALGORITHM = "HS256"
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(os.getenv("MODEL_NAME", "gemini-3-flash-preview"))
+model = genai.GenerativeModel(os.getenv("MODEL_NAME", "gemini-1.5-flash"))
 
+# --- 2. CORS MIDDLEWARE ---
+# Essential for allowing Lovable to send Authorization headers
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# --- 2. MODELS ---
+# --- 3. MODELS ---
 class ChatRequest(BaseModel):
     user_input: str
     current_stage: int
@@ -44,113 +49,92 @@ class ChatRequest(BaseModel):
     book_id: str
     session_id: Optional[str] = None
 
-# --- 3. AUTH HELPERS ---
+# --- 4. AUTH HELPERS ---
 def create_access_token(data: dict):
+    """Creates a local JWT token for the user session."""
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(days=30)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
 async def get_current_user(authorization: str = Header(None)):
+    """Dependency to protect routes and extract user identity."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
     token = authorization.split(" ")[1]
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         user_id = payload.get("user_id")
-        if not user_id: raise HTTPException(status_code=401)
+        if not user_id: 
+            raise HTTPException(status_code=401)
         return user_id
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid session")
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
 
-# --- 4. ENDPOINTS ---
+# --- 5. LOGIN ENDPOINT ---
 
 @app.post("/auth/login")
 async def auth_login(payload: dict):
+    """
+    Exchanges a Google Credential for an app-specific JWT.
+    Updates or Creates the user in Supabase.
+    """
     token = payload.get("credential")
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing credential")
+
     try:
-        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        # 1. Verify the Google ID Token
+        idinfo = id_token.verify_oauth2_token(
+            token, 
+            google_requests.Request(), 
+            GOOGLE_CLIENT_ID
+        )
+
+        # 2. Extract user profile info
         user_data = {
             "email": idinfo['email'],
             "name": idinfo.get('name'),
             "avatar_url": idinfo.get('picture'),
             "last_login": datetime.utcnow().isoformat()
         }
+
+        # 3. Upsert user into Supabase 'users' table
+        # If email exists, update the record. Otherwise, insert new.
         res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
+        
+        if not res.data:
+            raise HTTPException(status_code=500, detail="Database error during upsert")
+            
         user_record = res.data[0]
+
+        # 4. Create an internal App JWT
         access_token = create_access_token({"user_id": user_record['id']})
-        return {"token": access_token, "user": user_record}
-    except Exception:
-        raise HTTPException(status_code=401, detail="Google Auth Failed")
+
+        # 5. Return token and user profile to Lovable
+        return {
+            "token": access_token, 
+            "user": {
+                "id": user_record['id'],
+                "name": user_record['name'],
+                "email": user_record['email'],
+                "avatar": user_record['avatar_url']
+            }
+        }
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    except Exception as e:
+        print(f"Auth error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error during Authentication")
+
+# --- PLACEHOLDERS FOR REMAINING LOGIC ---
+# These will be updated with full logic in subsequent steps as we add sessions.
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
-    books = supabase.table("books").select("id, title").execute().data
-    results = []
-    for b in books:
-        img = supabase.table("story_stages").select("image_url").eq("book_id", b["id"]).eq("stage_number", 1).single().execute().data
-        results.append({"book_id": b["id"], "title": b["title"], "thumbnail": img["image_url"] if img else None})
-    return {"books": results}
+    # Logic to fetch books...
+    return {"message": "Authenticated. Books will be returned here."}
 
-@app.get("/session/{book_id}")
-async def get_session(book_id: str, user_id: str = Depends(get_current_user)):
-    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).order("created_at", desc=True).limit(1).execute()
-    if res.data:
-        return {"has_session": True, "session": res.data[0]}
-    return {"has_session": False}
-
-@app.post("/session/{book_id}/start")
-async def start_session(book_id: str, payload: dict, user_id: str = Depends(get_current_user)):
-    if payload.get("archive_existing"):
-        supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
-    
-    book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
-    stages = supabase.table("story_stages").select("*").eq("book_id", book_id).order("stage_number").execute().data
-    
-    session_data = {
-        "user_id": user_id,
-        "book_id": book_id,
-        "current_stage": 1,
-        "stage_turn_count": 0,
-        "story_context": f"Book: {book['title']}"
-    }
-    new_session = supabase.table("sessions").insert(session_data).execute().data[0]
-    
-    return {
-        "reply": f"Hi! I'm Story Buddy. {book['welcome_question']}",
-        "session_id": new_session["id"],
-        "current_stage": 1,
-        "total_stages": len(stages),
-        "image_url": stages[0]["image_url"]
-    }
-
-@app.post("/chat")
-async def chat_endpoint(req: ChatRequest, user_id: str = Depends(get_current_user)):
-    updated_context = req.story_context + f" | Child: {req.user_input}"
-    stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
-    stages_map = {s['stage_number']: s for s in stages}
-    
-    curr = stages_map[req.current_stage]
-    nxt = stages_map.get(req.current_stage + 1)
-    
-    nudge = f"Theme: {curr['theme']}. " + (f"Next: {nxt['theme']}" if nxt else "Final goodbye.")
-    prompt = f"Co-author mode. Context: {updated_context}. Goal: {nudge}. Max 2 sentences. End with [ADVANCE] if turn 3, else [STAY]."
-    
-    ai_res = model.generate_content(prompt).text
-    should_adv = "[ADVANCE]" in ai_res and nxt
-    new_stage = req.current_stage + 1 if should_adv else req.current_stage
-    
-    # Persist to DB
-    if req.session_id:
-        supabase.table("sessions").update({
-            "current_stage": new_stage,
-            "stage_turn_count": 0 if should_adv else req.stage_turn_count + 1,
-            "story_context": updated_context
-        }).eq("id", req.session_id).execute()
-
-    return {
-        "reply": ai_res.replace("[ADVANCE]", "").replace("[STAY]", "").strip(),
-        "current_stage": new_stage,
-        "action": "ADVANCE" if should_adv else ("FINISH" if not nxt and "[ADVANCE]" in ai_res else "STAY"),
-        "image_url": stages_map[new_stage]["image_url"]
-    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
