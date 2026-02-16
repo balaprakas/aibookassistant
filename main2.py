@@ -22,6 +22,10 @@ MAX_TURNS_PER_STAGE = 3
 
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+if GEMINI_API_KEY:
+    print(f"DEBUG: Key found! Starts with {GEMINI_API_KEY[:4]} and ends with {GEMINI_API_KEY[-4:]}")
+else:
+    print("DEBUG: GEMINI_API_KEY is NOT FOUND in environment variables!")
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(MODEL_NAME)
 
@@ -204,3 +208,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
