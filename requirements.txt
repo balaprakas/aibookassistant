@@ -3,3 +3,6 @@ uvicorn
 google-generativeai
 supabase
 python-dotenv
+python-jose
+google-auth
+google-auth-oauthlib
