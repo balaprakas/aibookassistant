@@ -35,6 +35,9 @@ origins = [
     "https://accessible-aili-untoldstories-da4d51c9.lovable.app", # Add your Lovable domain here
     "http://localhost:5173", # Common for local development
     "http://localhost:3000",
+    "https://a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovableproject.com",
+    "https://id-preview--a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovable.app",
+    "https://aistoryassistant.lovable.app"
 ]
 
 app.add_middleware(
