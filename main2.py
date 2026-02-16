@@ -1,33 +1,32 @@
 import os
+from datetime import datetime, timedelta
+from typing import Optional
+
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
+from jose import JWTError, jwt
 from pydantic import BaseModel
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
-# Load variables from .env file
 load_dotenv()
-
 app = FastAPI()
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("MODEL_NAME")
-
-# Constants for Story Logic
-MAX_TURNS_PER_STAGE = 3 
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+JWT_SECRET = os.getenv("JWT_SECRET")
+ALGORITHM = "HS256"
 
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-if GEMINI_API_KEY:
-    print(f"DEBUG: Key found! Starts with {GEMINI_API_KEY[:4]} and ends with {GEMINI_API_KEY[-4:]}")
-else:
-    print("DEBUG: GEMINI_API_KEY is NOT FOUND in environment variables!")
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(MODEL_NAME)
+model = genai.GenerativeModel(os.getenv("MODEL_NAME", "gemini-3-flash-preview"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,176 +35,122 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- 2. MODELS ---
 class ChatRequest(BaseModel):
     user_input: str
     current_stage: int
     stage_turn_count: int
     story_context: str
     book_id: str
+    session_id: Optional[str] = None
 
-# --- 2. ENDPOINTS ---
+# --- 3. AUTH HELPERS ---
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=30)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
-@app.get("/")
-async def root():
-    return {"message": "Story Buddy API is running!"}
+async def get_current_user(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+        if not user_id: raise HTTPException(status_code=401)
+        return user_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid session")
+
+# --- 4. ENDPOINTS ---
+
+@app.post("/auth/login")
+async def auth_login(payload: dict):
+    token = payload.get("credential")
+    try:
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        user_data = {
+            "email": idinfo['email'],
+            "name": idinfo.get('name'),
+            "avatar_url": idinfo.get('picture'),
+            "last_login": datetime.utcnow().isoformat()
+        }
+        res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
+        user_record = res.data[0]
+        access_token = create_access_token({"user_id": user_record['id']})
+        return {"token": access_token, "user": user_record}
+    except Exception:
+        raise HTTPException(status_code=401, detail="Google Auth Failed")
 
 @app.get("/books")
-async def get_all_books():
-    """Returns all books with their Stage 1 image as a thumbnail."""
-    try:
-        # 1. Fetch all books
-        books_res = supabase.table("books").select("id, title").execute()
-        
-        if not books_res.data:
-            return {"total_books": 0, "books": []}
+async def get_all_books(user_id: str = Depends(get_current_user)):
+    books = supabase.table("books").select("id, title").execute().data
+    results = []
+    for b in books:
+        img = supabase.table("story_stages").select("image_url").eq("book_id", b["id"]).eq("stage_number", 1).single().execute().data
+        results.append({"book_id": b["id"], "title": b["title"], "thumbnail": img["image_url"] if img else None})
+    return {"books": results}
 
-        all_books = []
-        
-        for book in books_res.data:
-            # 2. For each book, fetch the image for stage_number 1
-            stage_res = supabase.table("story_stages") \
-                .select("image_url") \
-                .eq("book_id", book["id"]) \
-                .eq("stage_number", 1) \
-                .single() \
-                .execute()
-            
-            # Use a placeholder if no image is found
-            thumbnail = stage_res.data["image_url"] if stage_res.data else "https://via.placeholder.com/150"
-            
-            all_books.append({
-                "book_id": book["id"],
-                "title": book["title"],
-                "thumbnail": thumbnail
-            })
+@app.get("/session/{book_id}")
+async def get_session(book_id: str, user_id: str = Depends(get_current_user)):
+    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).order("created_at", desc=True).limit(1).execute()
+    if res.data:
+        return {"has_session": True, "session": res.data[0]}
+    return {"has_session": False}
 
-        return {
-            "total_books": len(all_books),
-            "books": all_books
-        }
-    except Exception as e:
-        print(f"Error fetching books: {e}")
-        raise HTTPException(status_code=500, detail="Could not load books.")
-
-@app.get("/start/{book_id}")
-async def start_story(book_id: str):
-    """Initializes the story and returns the dynamic total stages count."""
-    try:
-        # 1. Fetch book metadata
-        book_res = supabase.table("books").select("*").eq("id", book_id).single().execute()
-        if not book_res.data:
-            raise HTTPException(status_code=404, detail="Book not found.")
-        
-        # 2. Fetch all stages to get count and first image
-        stages_res = supabase.table("story_stages").select("stage_number, image_url").eq("book_id", book_id).order("stage_number").execute()
-        
-        total_stages = len(stages_res.data)
-        first_stage = stages_res.data[0] if stages_res.data else None
-
-        return {
-            "reply": f"Hi! I'm your Story Buddy. {book_res.data['welcome_question']}",
-            "current_stage": 1,
-            "total_stages": total_stages, 
-            "stage_turn_count": 0,
-            "story_context": f"Book: {book_res.data['title']}",
-            "action": "STAY",
-            "image_url": first_stage["image_url"] if first_stage else None,
-            "book_id": book_id
-        }
-    except Exception as e:
-        print(f"Start Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/session/{book_id}/start")
+async def start_session(book_id: str, payload: dict, user_id: str = Depends(get_current_user)):
+    if payload.get("archive_existing"):
+        supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
+    
+    book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
+    stages = supabase.table("story_stages").select("*").eq("book_id", book_id).order("stage_number").execute().data
+    
+    session_data = {
+        "user_id": user_id,
+        "book_id": book_id,
+        "current_stage": 1,
+        "stage_turn_count": 0,
+        "story_context": f"Book: {book['title']}"
+    }
+    new_session = supabase.table("sessions").insert(session_data).execute().data[0]
+    
+    return {
+        "reply": f"Hi! I'm Story Buddy. {book['welcome_question']}",
+        "session_id": new_session["id"],
+        "current_stage": 1,
+        "total_stages": len(stages),
+        "image_url": stages[0]["image_url"]
+    }
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest):
-    """Main loop with dynamic progression and strict name-check logic."""
-    
+async def chat_endpoint(req: ChatRequest, user_id: str = Depends(get_current_user)):
     updated_context = req.story_context + f" | Child: {req.user_input}"
+    stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
+    stages_map = {s['stage_number']: s for s in stages}
     
-    # 1. Fetch stage info and total count dynamically
-    stages_res = supabase.table("story_stages") \
-        .select("stage_number, theme, image_url") \
-        .eq("book_id", req.book_id) \
-        .execute()
+    curr = stages_map[req.current_stage]
+    nxt = stages_map.get(req.current_stage + 1)
     
-    total_stages = len(stages_res.data)
-    stages_data = {s['stage_number']: s for s in stages_res.data}
+    nudge = f"Theme: {curr['theme']}. " + (f"Next: {nxt['theme']}" if nxt else "Final goodbye.")
+    prompt = f"Co-author mode. Context: {updated_context}. Goal: {nudge}. Max 2 sentences. End with [ADVANCE] if turn 3, else [STAY]."
     
-    current_stage_info = stages_data.get(req.current_stage)
-    next_stage_exists = (req.current_stage + 1) in stages_data
-    next_stage_info = stages_data.get(req.current_stage + 1)
-
-    if not current_stage_info:
-        raise HTTPException(status_code=404, detail="Stage info missing.")
-
-    next_theme_clue = next_stage_info['theme'] if next_stage_exists else "the magical ending"
-
-    # --- PROGRESSION NUDGES ---
-    if req.current_stage == 1 and req.stage_turn_count < 1:
-        nudge = "The story just started. Your ONLY goal is to find out the names for the hero and their friend. Do NOT move on until they give you names."
-    elif req.stage_turn_count < 2:
-        nudge = f"Deepen the scene. Ask specific questions about what they see in this image: {current_stage_info['theme']}."
-    else:
-        nudge = f"Time to transition. Specifically ask if they see any images related to: {next_theme_clue}."
-
-    prompt = f"""
-    You are 'Story Buddy', a magical co-author. 
-    CURRENT GOAL: {current_stage_info['theme']}
-    NEXT DISCOVERY: {next_theme_clue}
-    TURN: {req.stage_turn_count + 1} of {MAX_TURNS_PER_STAGE}
-    CHILD'S INPUT: "{req.user_input}"
-
-    DIRECTIONS:
-    1. Acknowledge child warmly. {nudge}
-    2. If turn < {MAX_TURNS_PER_STAGE}, end with [STAY]. 
-    3. If turn >= {MAX_TURNS_PER_STAGE}, ask discovery question about NEXT DISCOVERY and end with [ADVANCE].
-    4. Keep it to 2 enchanting sentences.
-    """
-
-    try:
-        response = model.generate_content(prompt)
-        raw_response = response.text
-        
-        # --- DYNAMIC ADVANCEMENT LOGIC ---
-        button_done = "i have finished writing" in req.user_input.lower()
-        ai_wants_advance = "[ADVANCE]" in raw_response
-        turn_limit_reached = req.stage_turn_count >= (MAX_TURNS_PER_STAGE - 1)
-        
-        # Gate: At least 2 turns (3 messages) unless explicitly finished
-        ready_to_move = (req.stage_turn_count >= 2) or button_done
-        should_advance = ready_to_move and (ai_wants_advance or turn_limit_reached)
-        
-        if should_advance and next_stage_exists:
-            new_stage = req.current_stage + 1
-            action = "ADVANCE"
-            new_turn_count = 0
-        elif should_advance and not next_stage_exists:
-            new_stage = req.current_stage
-            action = "FINISH"
-            new_turn_count = req.stage_turn_count + 1
-        else:
-            new_stage = req.current_stage
-            action = "STAY"
-            new_turn_count = req.stage_turn_count + 1
-
-        final_stage_info = stages_data.get(new_stage, current_stage_info)
-        clean_reply = raw_response.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
-
-        return {
-            "reply": clean_reply,
+    ai_res = model.generate_content(prompt).text
+    should_adv = "[ADVANCE]" in ai_res and nxt
+    new_stage = req.current_stage + 1 if should_adv else req.current_stage
+    
+    # Persist to DB
+    if req.session_id:
+        supabase.table("sessions").update({
             "current_stage": new_stage,
-            "total_stages": total_stages,
-            "stage_turn_count": new_turn_count,
-            "story_context": updated_context,
-            "action": action,
-            "image_url": final_stage_info["image_url"]
-        }
-    except Exception as e:
-        print(f"Chat Error: {e}")
-        raise HTTPException(status_code=500, detail="Story Buddy is resting.")
+            "stage_turn_count": 0 if should_adv else req.stage_turn_count + 1,
+            "story_context": updated_context
+        }).eq("id", req.session_id).execute()
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
+    return {
+        "reply": ai_res.replace("[ADVANCE]", "").replace("[STAY]", "").strip(),
+        "current_stage": new_stage,
+        "action": "ADVANCE" if should_adv else ("FINISH" if not nxt and "[ADVANCE]" in ai_res else "STAY"),
+        "image_url": stages_map[new_stage]["image_url"]
+    }
