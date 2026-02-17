@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI()
+app = FastAPI(title="Story Buddy - Direct Flow")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -28,12 +28,10 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-# --- 2. THE CORS FIX ---
-# Replace the wildcard "*" with your actual Lovable URL.
-# If you are testing locally, also include "http://localhost:5173" or similar.
+# --- 2. CORS CONFIGURATION ---
 origins = [
-    "https://accessible-aili-untoldstories-da4d51c9.lovable.app", # Add your Lovable domain here
-    "http://localhost:5173", # Common for local development
+    "https://accessible-aili-untoldstories-da4d51c9.lovable.app",
+    "http://localhost:5173",
     "http://localhost:3000",
     "https://a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovableproject.com",
     "https://id-preview--a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovable.app",
@@ -42,7 +40,7 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, # Explicit list, NOT ["*"]
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,7 +53,6 @@ class ChatRequest(BaseModel):
     stage_turn_count: int
     story_context: str
     book_id: str
-    session_id: Optional[str] = None
 
 # --- 4. AUTH HELPERS ---
 def create_access_token(data: dict):
@@ -92,6 +89,7 @@ async def auth_login(payload: dict):
             "avatar_url": idinfo.get('picture'),
             "last_login": datetime.utcnow().isoformat()
         }
+        # Upsert user into DB
         res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
         user_record = res.data[0]
         access_token = create_access_token({"user_id": user_record['id']})
@@ -102,74 +100,67 @@ async def auth_login(payload: dict):
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
-    books = supabase.table("books").select("id, title").execute().data
+    """Fetches books for the library view."""
+    res = supabase.table("books").select("id, title").execute()
+    books = res.data
     results = []
     for b in books:
+        # Get the first image for the thumbnail
         img_res = supabase.table("story_stages").select("image_url").eq("book_id", b["id"]).eq("stage_number", 1).execute()
         img = img_res.data[0] if img_res.data else None
         results.append({"book_id": b["id"], "title": b["title"], "thumbnail": img["image_url"] if img else None})
     return {"books": results}
 
-@app.get("/session/{book_id}")
-async def get_session(book_id: str, user_id: str = Depends(get_current_user)):
-    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).order("created_at", desc=True).limit(1).execute()
-    if res.data:
-        return {"has_session": True, "session": res.data[0]}
-    return {"has_session": False}
-
 @app.post("/session/{book_id}/start")
-async def start_session(book_id: str, payload: dict, user_id: str = Depends(get_current_user)):
-    if payload.get("archive_existing"):
-        supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
-    
+async def start_session(book_id: str, user_id: str = Depends(get_current_user)):
+    """Starts a fresh story session immediately."""
+    # Fetch book info
     book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
+    # Fetch all stages for this book
     stages = supabase.table("story_stages").select("*").eq("book_id", book_id).order("stage_number").execute().data
     
-    session_data = {
-        "user_id": user_id,
-        "book_id": book_id,
-        "current_stage": 1,
-        "stage_turn_count": 0,
-        "story_context": f"Book: {book['title']}"
-    }
-    new_session = supabase.table("sessions").insert(session_data).execute().data[0]
-    
+    if not book or not stages:
+        raise HTTPException(status_code=404, detail="Book content not found")
+
     return {
         "reply": f"Hi! I'm Story Buddy. {book['welcome_question']}",
-        "session_id": new_session["id"],
         "current_stage": 1,
         "total_stages": len(stages),
-        "image_url": stages[0]["image_url"]
+        "image_url": stages[0]["image_url"],
+        "story_context": f"Book: {book['title']}"
     }
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest, user_id: str = Depends(get_current_user)):
+    """Main AI chat loop."""
     updated_context = req.story_context + f" | Child: {req.user_input}"
+    
+    # Get stages to know where we are
     stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
-    curr = stages_map[req.current_stage]
+    curr = stages_map.get(req.current_stage)
     nxt = stages_map.get(req.current_stage + 1)
     
+    if not curr:
+        raise HTTPException(status_code=404, detail="Stage not found")
+
+    # Prompt Logic
     nudge = f"Theme: {curr['theme']}. " + (f"Next: {nxt['theme']}" if nxt else "Final goodbye.")
-    prompt = f"Co-author mode. Context: {updated_context}. Goal: {nudge}. Max 2 sentences. End with [ADVANCE] if turn 3, else [STAY]."
+    prompt = f"Co-author mode. Context: {updated_context}. Goal: {nudge}. Max 2 sentences. End with [ADVANCE] if turn {req.stage_turn_count + 1} >= 3, else [STAY]."
     
     ai_res = model.generate_content(prompt).text
+    
     should_adv = "[ADVANCE]" in ai_res and nxt
     new_stage = req.current_stage + 1 if should_adv else req.current_stage
     
-    if req.session_id:
-        supabase.table("sessions").update({
-            "current_stage": new_stage,
-            "stage_turn_count": 0 if should_adv else req.stage_turn_count + 1,
-            "story_context": updated_context
-        }).eq("id", req.session_id).execute()
-
     return {
         "reply": ai_res.replace("[ADVANCE]", "").replace("[STAY]", "").strip(),
         "current_stage": new_stage,
+        "stage_turn_count": 0 if should_adv else req.stage_turn_count + 1,
         "action": "ADVANCE" if should_adv else ("FINISH" if not nxt and "[ADVANCE]" in ai_res else "STAY"),
-        "image_url": stages_map[new_stage]["image_url"]
+        "image_url": stages_map[new_stage]["image_url"],
+        "story_context": updated_context
     }
 
 if __name__ == "__main__":
