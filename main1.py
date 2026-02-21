@@ -14,7 +14,7 @@ app.add_middleware(
 )
 
 # --- 2. GEMINI CONFIG ---
-GEMINI_API_KEY = "AIzaSyDxJe22uh5V3cCFeOMlyQYd9-S9Q4f5oGI" 
+
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-3-flash-preview')
 
@@ -130,4 +130,5 @@ async def chat_endpoint(req: ChatRequest):
 
     except Exception as e:
         print(f"Error: {e}")
+
         raise HTTPException(status_code=500, detail="The Story Buddy is thinking...")
