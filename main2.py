@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Creative Coach Mode")
+app = FastAPI(title="Story Buddy API - Dynamic Character Fix")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -158,28 +158,28 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
-    updated_context = (req.story_context or "") + f" | Child: {req.user_input}"
-    stages = supabase.table("supabase_story_stages" if "supabase_story_stages" in globals() else "story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
+    updated_context = (req.story_context or "") + f" | User input: {req.user_input}"
+    stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # NEW COACH PROMPT: Focuses on child-led writing and image nudging
+    # DYNAMIC COACH PROMPT: Learns and uses whatever names the kid provides
     prompt = f"""
-    You are Story Buddy, a magical creative coach for a child author. 
-    Context so far: {updated_context}
+    You are Story Buddy, a creative coach for a child. 
+    Full Context: {updated_context}
     Current Stage Goal: {curr['theme']}
     
-    COACHING RULES:
-    1. DO NOT write the story narrative yourself. The child must lead.
-    2. ACKNOWLEDGE: Warmly repeat the details the child just gave (e.g., if they provided names like Bala and Dhiaan, use them immediately and DO NOT ask for them again).
-    3. NUDGE: Encourage the child to look at their story sheet/image. Ask them to describe what they see happening there or where the characters are going.
-    4. SUPPORT: Only provide sample story sentences if the child says "I'm stuck," "help me," or "I don't know."
-    5. INTERACTION: End every message with a curious question about the characters' next move or their surroundings.
-    6. PROGRESS: If the child has contributed 3 meaningful turns in this stage, include [ADVANCE]. Otherwise, include [STAY].
+    STRICT RULES:
+    1. EXTRACT NAMES: Look at the 'Full Context' to see what names the child has given for the hero and the chameleon. 
+    2. USE DYNAMIC NAMES: Once names are given (like 'Bala' or 'Dhiaan' or anything else), refer to them as the CHARACTERS in the story.
+    3. NO SELF-IDENTIFICATION: Never call the child by the character names. Talk ABOUT the characters to the child.
+    4. IMAGE FOCUS: Tell the child to look at their story sheet or image. Ask them what those characters (using their names) are doing in that specific scene.
+    5. NO AUTO-WRITING: Do not write the story. Only nudge with questions. If the child is stuck, give a tiny hint using their character names.
+    6. PROGRESS: If turn count {req.stage_turn_count + 1} >= 3, include [ADVANCE]. Otherwise, include [STAY].
     
-    Tone: Encouraging, simple (5-8 year old level), and inquisitive.
+    Tone: Encouraging, inquisitive, simple.
     """
     
     ai_res_raw = model.generate_content(prompt).text
