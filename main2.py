@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Character Identification Fix")
+app = FastAPI(title="Story Buddy API - Author Coach Mode")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -31,7 +31,14 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- 2. CORS CONFIGURATION ---
-origins = ["*"] # Adjust for production security
+origins = [
+    "https://accessible-aili-untoldstories-da4d51c9.lovable.app",
+    "http://localhost:5173",
+    "https://aistoryassistant.lovable.app",
+    "https://a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovableproject.com",
+    "https://id-preview--a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovable.app"
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -52,7 +59,7 @@ class ChatRequest(BaseModel):
 class SessionActionRequest(BaseModel):
     archive_existing: bool = False
 
-# --- 4. BACKGROUND TASKS ---
+# --- 4. BACKGROUND TASKS (ASYNC LOGGING) ---
 def log_to_db(session_id: str, user_id: str, role: str, content: str):
     try:
         supabase.table("chat_messages").insert({
@@ -84,38 +91,95 @@ async def get_current_user(authorization: str = Header(None)):
 
 # --- 6. ENDPOINTS ---
 
+@app.post("/auth/login")
+async def auth_login(payload: dict):
+    token = payload.get("credential")
+    idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+    user_data = {
+        "email": idinfo['email'],
+        "name": idinfo.get('name'),
+        "avatar_url": idinfo.get('picture'),
+        "last_login": datetime.utcnow().isoformat()
+    }
+    res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
+    user_record = res.data[0]
+    access_token = jwt.encode({"user_id": user_record['id']}, JWT_SECRET, algorithm=ALGORITHM)
+    return {"token": access_token, "user": user_record}
+
+@app.get("/books")
+async def get_all_books(user_id: str = Depends(get_current_user)):
+    books = supabase.table("books").select("id, title").execute().data
+    results = []
+    for b in books:
+        img = supabase.table("story_stages").select("image_url").eq("book_id", b["id"]).eq("stage_number", 1).execute().data
+        results.append({
+            "book_id": b["id"], 
+            "title": b["title"], 
+            "thumbnail": img[0]["image_url"] if img else None
+        })
+    return {"books": results}
+
+@app.get("/session/{book_id}/check")
+async def check_session(book_id: str, user_id: str = Depends(get_current_user)):
+    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
+    return {"has_existing": len(res.data) > 0, "session": res.data[0] if res.data else None}
+
+@app.post("/session/{book_id}/start")
+async def start_session(book_id: str, req: SessionActionRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
+    if req.archive_existing:
+        supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
+    
+    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
+    book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
+    
+    if res.data:
+        session = res.data[0]
+        msg_res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session["id"]).order("created_at", desc=True).limit(10).execute()
+        recent_messages = msg_res.data[::-1]
+        welcome_msg = "Welcome back! Ready to continue our story?"
+    else:
+        session = supabase.table("sessions").insert({
+            "user_id": user_id, "book_id": book_id, "current_stage": 1, "stage_turn_count": 0, "story_context": f"Book: {book['title']}"
+        }).execute().data[0]
+        welcome_msg = f"Hi! I'm Story Buddy. {book['welcome_question']}"
+        recent_messages = []
+        background_tasks.add_task(log_to_db, session["id"], user_id, "assistant", welcome_msg)
+
+    stage = supabase.table("story_stages").select("*").eq("book_id", book_id).eq("stage_number", session['current_stage']).single().execute().data
+    
+    return {
+        "reply": welcome_msg, 
+        "session": session, 
+        "image_url": stage['image_url'], 
+        "recent_history": recent_messages
+    }
+
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
-    # We append the child's input specifically as character details to the context
-    updated_context = (req.story_context or "") + f" | Child specified character names/details: {req.user_input}"
-    
+    updated_context = (req.story_context or "") + f" | Kid/Author: {req.user_input}"
     stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # REVISED PROMPT: Prevents "Hello [Character Name]" error
+    # ENHANCED PROMPT: Strictly separates "Kid/Author" from "Characters"
     prompt = f"""
-    You are Story Buddy, a creative coach helping a child write a book.
+    You are Story Buddy, a creative coach for a child author. 
+    Full Context: {updated_context}
+    Current Goal: {curr['theme']}
     
-    HISTORY AND CONTEXT:
-    {updated_context}
-    
-    GOAL FOR THIS PART OF THE STORY:
-    {curr['theme']}
-    
-    INSTRUCTIONS:
-    1. NEVER address the child by the names they provide. Those are the NAMES OF THE CHARACTERS. 
-    2. If the child provided names (like "Bala and Dhiaan"), acknowledge them as characters: e.g., "I love the names you chose for the boy and the chameleon!"
-    3. NUDGE: Encourage the child to look at their story sheet/image. Ask them what the characters are doing in the picture.
-    4. NO AUTO-WRITING: Do not write the story for them. Wait for the child to describe what happens.
-    5. IDENTIFICATION: If the child just gave names, confirm who is who. For example: "Which one is the boy, and which one is the chameleon?"
+    STRICT OPERATING RULES:
+    1. CHARACTER NAMES: Identify the names provided by the kid (e.g., Bala, Dhiaan). These are the STORY CHARACTERS.
+    2. NEVER address the kid by the character names. They are the AUTHOR. 
+    3. DON'T ASK AGAIN: Once you have the character names, use them naturally and do not ask for them again.
+    4. IMAGE NUDGING: Your first priority is to get the kid to look at their story sheet or image. Ask them: "Looking at your picture, what are [Character Name 1] and [Character Name 2] doing right now?"
+    5. KID WRITES FIRST: Do not write the story. Only if the kid says "I'm stuck," "help," or "I don't know," you can suggest one sentence to help them out.
     6. PROGRESS: If turn count {req.stage_turn_count + 1} >= 3, include [ADVANCE]. Otherwise, include [STAY].
     
-    Tone: Magical, encouraging, and strictly a coach/assistant.
+    Tone: Enthusiastic, supportive, but always lets the kid lead the writing.
     """
     
     ai_res_raw = model.generate_content(prompt).text
@@ -137,4 +201,11 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
         "story_context": updated_context
     }
 
-# Remaining endpoints (/books, /session/start, etc.) should remain as per your latest working version.
+@app.get("/session/{session_id}/history")
+async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depends(get_current_user)):
+    res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session_id).order("created_at", desc=True).range(offset, offset + 10).execute()
+    return {"history": res.data}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
