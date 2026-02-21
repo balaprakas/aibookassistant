@@ -26,7 +26,7 @@ ALGORITHM = "HS256"
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+model = genai.GenerativeModel("gemini-3.1-pro-preview")
 
 # --- 2. CORS CONFIGURATION ---
 origins = [
@@ -200,3 +200,4 @@ async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depe
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
