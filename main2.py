@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Author Coach Mode")
+app = FastAPI(title="Story Buddy API - Final Author Logic")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -31,14 +31,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- 2. CORS CONFIGURATION ---
-origins = [
-    "https://accessible-aili-untoldstories-da4d51c9.lovable.app",
-    "http://localhost:5173",
-    "https://aistoryassistant.lovable.app",
-    "https://a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovableproject.com",
-    "https://id-preview--a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovable.app"
-]
-
+origins = ["*"] 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -59,7 +52,7 @@ class ChatRequest(BaseModel):
 class SessionActionRequest(BaseModel):
     archive_existing: bool = False
 
-# --- 4. BACKGROUND TASKS (ASYNC LOGGING) ---
+# --- 4. BACKGROUND TASKS ---
 def log_to_db(session_id: str, user_id: str, role: str, content: str):
     try:
         supabase.table("chat_messages").insert({
@@ -158,28 +151,29 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
-    updated_context = (req.story_context or "") + f" | Kid/Author: {req.user_input}"
+    # REFINED CONTEXT LABELING: Forces AI to see user as Author
+    updated_context = (req.story_context or "") + f" | AUTHOR INPUT: {req.user_input}"
+    
     stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # ENHANCED PROMPT: Strictly separates "Kid/Author" from "Characters"
+    # THE "AUTHOR VS CHARACTER" SYSTEM PROMPT
     prompt = f"""
-    You are Story Buddy, a creative coach for a child author. 
-    Full Context: {updated_context}
-    Current Goal: {curr['theme']}
+    You are Story Buddy, a magical co-author coach.
     
-    STRICT OPERATING RULES:
-    1. CHARACTER NAMES: Identify the names provided by the kid (e.g., Bala, Dhiaan). These are the STORY CHARACTERS.
-    2. NEVER address the kid by the character names. They are the AUTHOR. 
-    3. DON'T ASK AGAIN: Once you have the character names, use them naturally and do not ask for them again.
-    4. IMAGE NUDGING: Your first priority is to get the kid to look at their story sheet or image. Ask them: "Looking at your picture, what are [Character Name 1] and [Character Name 2] doing right now?"
-    5. KID WRITES FIRST: Do not write the story. Only if the kid says "I'm stuck," "help," or "I don't know," you can suggest one sentence to help them out.
-    6. PROGRESS: If turn count {req.stage_turn_count + 1} >= 3, include [ADVANCE]. Otherwise, include [STAY].
+    IMPORTANT RULES:
+    1. THE USER IS THE AUTHOR. Never address the user as the characters (e.g., if they say 'Bala and Dhiaan', those are characters in the story, not the user's names).
+    2. USE THE NAMES: Once names are given, refer to them as the characters. 'I love the names Bala and Dhiaan for your characters!'
+    3. THE IMAGE IS THE KEY: Constantly nudge the author to look at their story sheet/drawing. Ask: 'What are the characters doing in your picture right now?'
+    4. NO WRITING: Do not write story text. Only if the author says 'I'm stuck' or 'help', you can offer one short sentence.
+    5. CURRENT GOAL: {curr['theme']}
+    6. FULL STORY CONTEXT: {updated_context}
     
-    Tone: Enthusiastic, supportive, but always lets the kid lead the writing.
+    Goal: Acknowledge the author's input, ask about the image, and encourage them to write the next part.
+    Progress: Include [ADVANCE] only if the author has given 3+ creative inputs in this stage. Otherwise [STAY].
     """
     
     ai_res_raw = model.generate_content(prompt).text
