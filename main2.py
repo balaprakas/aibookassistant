@@ -165,7 +165,8 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     nxt = stages_map.get(req.current_stage + 1)
     
     prompt = f"""
-    You are Story Buddy, a magical co-author coach for a child author.
+    You are Story Buddy, a magical co-author coach for a child author. the kids use this system to get help in writing their stories. they are provided with a story book templates with placeholders to write stories and use the images at the back of the book to 
+    write their stories. the kid will come to this system to get help in proceeding with the story. 
     
     FULL STORY CONTEXT: {updated_context}
     CURRENT STAGE THEME: {curr['theme']}
@@ -209,3 +210,4 @@ async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depe
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
