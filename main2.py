@@ -26,6 +26,8 @@ ALGORITHM = "HS256"
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
+
+# STRICT MODEL LOCK: gemini-3-flash-preview
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- 2. CORS CONFIGURATION ---
@@ -50,9 +52,9 @@ class ChatRequest(BaseModel):
     user_input: str
     current_stage: int
     stage_turn_count: int
-    story_context: Optional[str] = "" # Handles potential nulls from frontend
+    story_context: Optional[str] = ""
     book_id: str
-    session_id: str # Crucial: Must be string UUID
+    session_id: str
 
 class SessionActionRequest(BaseModel):
     archive_existing: bool = False
@@ -124,28 +126,23 @@ async def check_session(book_id: str, user_id: str = Depends(get_current_user)):
 
 @app.post("/session/{book_id}/start")
 async def start_session(book_id: str, req: SessionActionRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
-    # Archive old sessions if requested
     if req.archive_existing:
         supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
     
-    # Check for an active session
     res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
     book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
     
     if res.data:
         session = res.data[0]
-        # Fetch last 10 messages for the UI
         msg_res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session["id"]).order("created_at", desc=True).limit(10).execute()
         recent_messages = msg_res.data[::-1]
-        welcome_msg = "Welcome back! Let's pick up where we left off."
+        welcome_msg = "Welcome back! Ready to continue our story?"
     else:
-        # Create a new session
         session = supabase.table("sessions").insert({
             "user_id": user_id, "book_id": book_id, "current_stage": 1, "stage_turn_count": 0, "story_context": f"Book: {book['title']}"
         }).execute().data[0]
         welcome_msg = f"Hi! I'm Story Buddy. {book['welcome_question']}"
         recent_messages = []
-        # Log welcome message to history table asynchronously
         background_tasks.add_task(log_to_db, session["id"], user_id, "assistant", welcome_msg)
 
     stage = supabase.table("story_stages").select("*").eq("book_id", book_id).eq("stage_number", session['current_stage']).single().execute().data
@@ -159,18 +156,29 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
 
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
-    # 1. Log user message
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
-    # 2. Logic for stages
-    updated_context = req.story_context + f" | Child: {req.user_input}"
+    updated_context = (req.story_context or "") + f" | Child: {req.user_input}"
     stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    prompt = f"Co-author mode. Context: {updated_context}. Goal: {curr['theme']}. Max 2 sentences. End with [ADVANCE] if turn {req.stage_turn_count + 1} >= 3, else [STAY]."
+    # ENHANCED PROMPT: Fixes acknowledgement and follow-up questions
+    prompt = f"""
+    You are Story Buddy, a magical and friendly co-author for a child. 
+    Context: {updated_context}
+    Current Goal: {curr['theme']}
+    
+    Rules for your response:
+    1. First, warmly acknowledge exactly what the child just said (e.g., "Wow! {req.user_input} is a great idea!" or "I love the names Bala and Dhiaan!").
+    2. Write exactly 2 sentences of the story that move the plot toward the Current Goal.
+    3. ALWAYS end your message with a simple, open-ended question that invites the child to decide the next detail.
+    4. Keep the tone very encouraging and simple (for a 5-8 year old).
+    5. Decide progress: if this is turn {req.stage_turn_count + 1} and turn >= 3, include [ADVANCE]. Otherwise, include [STAY].
+    """
+    
     ai_res_raw = model.generate_content(prompt).text
     
     should_adv = "[ADVANCE]" in ai_res_raw and nxt
@@ -178,7 +186,6 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     new_turn_count = 0 if should_adv else req.stage_turn_count + 1
     clean_reply = ai_res_raw.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
 
-    # 3. Log AI response and Update Session State in background
     background_tasks.add_task(log_to_db, req.session_id, user_id, "assistant", clean_reply)
     background_tasks.add_task(update_session_state, req.session_id, new_stage, new_turn_count, updated_context)
 
@@ -193,12 +200,9 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
 
 @app.get("/session/{session_id}/history")
 async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depends(get_current_user)):
-    """Fetch history in chunks for lazy loading."""
     res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session_id).order("created_at", desc=True).range(offset, offset + 10).execute()
     return {"history": res.data}
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
