@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Final")
+app = FastAPI(title="Story Buddy API - Creative Coach Mode")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -159,24 +159,27 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
     updated_context = (req.story_context or "") + f" | Child: {req.user_input}"
-    stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
+    stages = supabase.table("supabase_story_stages" if "supabase_story_stages" in globals() else "story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # ENHANCED PROMPT: Fixes acknowledgement and follow-up questions
+    # NEW COACH PROMPT: Focuses on child-led writing and image nudging
     prompt = f"""
-    You are Story Buddy, a magical and friendly co-author for a child. 
-    Context: {updated_context}
-    Current Goal: {curr['theme']}
+    You are Story Buddy, a magical creative coach for a child author. 
+    Context so far: {updated_context}
+    Current Stage Goal: {curr['theme']}
     
-    Rules for your response:
-    1. First, warmly acknowledge exactly what the child just said (e.g., "Wow! {req.user_input} is a great idea!" or "I love the names Bala and Dhiaan!").
-    2. Write exactly 2 sentences of the story that move the plot toward the Current Goal.
-    3. ALWAYS end your message with a simple, open-ended question that invites the child to decide the next detail.
-    4. Keep the tone very encouraging and simple (for a 5-8 year old).
-    5. Decide progress: if this is turn {req.stage_turn_count + 1} and turn >= 3, include [ADVANCE]. Otherwise, include [STAY].
+    COACHING RULES:
+    1. DO NOT write the story narrative yourself. The child must lead.
+    2. ACKNOWLEDGE: Warmly repeat the details the child just gave (e.g., if they provided names like Bala and Dhiaan, use them immediately and DO NOT ask for them again).
+    3. NUDGE: Encourage the child to look at their story sheet/image. Ask them to describe what they see happening there or where the characters are going.
+    4. SUPPORT: Only provide sample story sentences if the child says "I'm stuck," "help me," or "I don't know."
+    5. INTERACTION: End every message with a curious question about the characters' next move or their surroundings.
+    6. PROGRESS: If the child has contributed 3 meaningful turns in this stage, include [ADVANCE]. Otherwise, include [STAY].
+    
+    Tone: Encouraging, simple (5-8 year old level), and inquisitive.
     """
     
     ai_res_raw = model.generate_content(prompt).text
