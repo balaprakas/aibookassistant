@@ -169,45 +169,47 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # PASS 1: Evaluate current stage with Turn Logic
+    # PASS 1: BRAINSTORMING VS WRITING
     system_instruction = f"""
-    You are 'Story Buddy', a magical friend for a child author.
+    You are 'Story Buddy', a magical, silly, and very kind friend for a child author.
     
     CONTEXT: {updated_context}
     CURRENT THEME: {curr['theme']}
     CURRENT TURN: {req.stage_turn_count}
     
     RULES:
-    1. BRAINSTORMING (Turns 0-2): Be very curious! Ask about character names, outfits, location, or actions in the image.
-       - NEVER ask the child to "write" in the template during these turns.
-       - Always include [STAY].
-    2. WRITING CHECK (Turns 3+): After enough brainstorming, say: "Wow! Tell me when you have written this part in your template!"
-       - Only include [ADVANCE] if the child confirms they finished writing (e.g. "done", "yes", "i wrote it").
+    1. BRAINSTORMING (Turns 0-2): Be very curious! Focus ONLY on building the scene. 
+       - Ask specifically about: character clothes, where they are, what they are doing, or their names.
+       - NEVER ask the child to "write" in the template yet.
+       - Always end with [STAY].
+    2. WRITING PHASE (Turn 3+): Once you have details, say: "Wow! Tell me when you have written this part in your template!"
+       - Only include [ADVANCE] if the child confirms they are finished writing (e.g. "done", "yes", "i wrote it").
        - Otherwise, include [STAY].
-    3. Use simple, excited English. 2 short sentences max.
+    3. Keep response to 2 short sentences. Use simple, excited English.
     """
 
-    messages = [{"role": "system", "content": system_instruction}]
-    clean_history = [msg for msg in req.history if msg["content"] != req.user_input]
-    
+    # Format history for Gemini API
     history_for_genai = []
+    clean_history = [msg for msg in req.history if msg["content"] != req.user_input]
     for msg in clean_history:
         role = "model" if msg["role"] == "assistant" else "user"
         history_for_genai.append({"role": role, "parts": [msg["content"]]})
     
-    # Generate content using the new conversational instructions
-    full_prompt = [{"role": "user", "parts": [system_instruction + "\n\nUser: " + req.user_input]}]
-    ai_res_raw = model.generate_content(history_for_genai + [{"role": "user", "parts": [req.user_input]}]).text
+    # Add the system instruction as a user part to guide the current turn
+    history_for_genai.append({"role": "user", "parts": [f"System Instructions: {system_instruction}"]})
+    history_for_genai.append({"role": "user", "parts": [req.user_input]})
+    
+    ai_res_raw = model.generate_content(history_for_genai).text
     
     should_adv = "[ADVANCE]" in ai_res_raw and nxt
     clean_reply = ai_res_raw.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
 
-    # PASS 2: If advancing, get the next stage's question immediately
+    # PASS 2: Transition logic
     if should_adv:
         next_theme = nxt['theme']
-        next_prompt = f"The child finished writing. Now we are on a new scene: '{next_theme}'. Give a 1-sentence cheer, then ask a simple conversational question about what is happening in the new image."
+        next_prompt = f"The child finished writing. Now on a new page with theme: '{next_theme}'. Give a tiny cheer and ask a detail question about what they see in the new picture."
         next_res = model.generate_content(next_prompt).text
-        clean_reply = f"Yay! You did it! {next_res.strip()}"
+        clean_reply = f"Yay! Great job writing. {next_res.strip()}"
 
     new_stage = req.current_stage + 1 if should_adv else req.current_stage
     new_turn_count = 0 if should_adv else req.stage_turn_count + 1
