@@ -92,6 +92,29 @@ async def get_current_user(authorization: str = Header(None)):
 
 # --- 6. ENDPOINTS ---
 
+@app.post("/auth/login")
+async def auth_login(payload: dict):
+    token = payload.get("credential")
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing credential")
+        
+    try:
+        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        user_data = {
+            "email": idinfo['email'],
+            "name": idinfo.get('name'),
+            "avatar_url": idinfo.get('picture'),
+            "last_login": datetime.utcnow().isoformat()
+        }
+        # Upsert user into DB
+        res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
+        user_record = res.data[0]
+        access_token = create_access_token({"user_id": user_record['id']})
+        return {"token": access_token, "user": user_record}
+    except Exception as e:
+        print(f"Auth error: {e}")
+        raise HTTPException(status_code=401, detail="Google Auth Failed")
+
 @app.get("/")
 async def root():
     return {"status": "Story Buddy API is active"}
@@ -210,4 +233,5 @@ async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depe
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
