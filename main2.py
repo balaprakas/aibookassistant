@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Robust Login")
+app = FastAPI(title="Story Buddy API - Format Sync")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -39,120 +39,100 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 3. DATA MODELS ---
-class ChatRequest(BaseModel):
-    user_input: str
-    current_stage: int
-    stage_turn_count: int
-    story_context: Optional[str] = ""
-    book_id: str
-    session_id: str
-
-# --- 4. AUTH HELPERS ---
-
+# --- 3. AUTH HELPERS ---
 def create_access_token(user_id: str):
     expire = datetime.now(timezone.utc) + timedelta(minutes=60)
-    to_encode = {"user_id": str(user_id), "exp": expire, "type": "access"}
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+    return jwt.encode({"user_id": str(user_id), "exp": expire, "type": "access"}, JWT_SECRET, algorithm=ALGORITHM)
 
 async def get_current_user(authorization: str = Header(None)):
     if not authorization or "undefined" in authorization:
-        raise HTTPException(status_code=401, detail="Unauthorized: No token provided")
-    
-    token = authorization.split(" ")[1]
+        raise HTTPException(status_code=401, detail="Unauthorized: No token")
     try:
+        token = authorization.split(" ")[1]
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         return payload.get("user_id")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Unauthorized: Session expired")
+    except:
+        raise HTTPException(status_code=401, detail="Session expired")
 
-# --- 5. ENDPOINTS ---
+# --- 4. ENDPOINTS ---
 
 @app.post("/auth/login")
 async def auth_login(payload: dict = Body(...)):
     credential = payload.get("credential")
-    if not credential:
-        raise HTTPException(status_code=400, detail="Missing Google credential")
-        
-    try:
-        # 1. Verify Google Token
-        idinfo = id_token.verify_oauth2_token(credential, google_requests.Request(), GOOGLE_CLIENT_ID)
-        email = idinfo['email']
-        
-        user_data = {
-            "email": email,
-            "name": idinfo.get('name'),
-            "avatar_url": idinfo.get('picture'),
-            "last_login": datetime.now(timezone.utc).isoformat()
-        }
-        
-        # 2. Upsert to Supabase
-        # We use select() after upsert to ensure data is returned
-        res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
-        
-        # 3. Fallback: If upsert didn't return data, fetch it manually
-        if not res.data:
-            res = supabase.table("users").select("*").eq("email", email).execute()
-        
-        if not res.data:
-            raise Exception("Failed to create or retrieve user record")
-
-        user_record = res.data[0]
-        user_id = str(user_record['id'])
-        
-        # 4. Generate Token
-        access_token = create_access_token(user_id)
-        
-        # 5. EXPLICIT RETURN (Ensuring non-empty response)
-        response_data = {
-            "access_token": access_token,
-            "user": user_record,
-            "status": "success"
-        }
-        print(f"DEBUG: Returning login for {email}")
-        return response_data
-
-    except Exception as e:
-        print(f"CRITICAL LOGIN ERROR: {str(e)}")
-        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
+    idinfo = id_token.verify_oauth2_token(credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+    
+    user_data = {
+        "email": idinfo['email'],
+        "name": idinfo.get('name'),
+        "avatar_url": idinfo.get('picture'),
+        "last_login": datetime.now(timezone.utc).isoformat()
+    }
+    
+    res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
+    user_record = res.data[0] if res.data else supabase.table("users").select("*").eq("email", idinfo['email']).execute().data[0]
+    
+    token = create_access_token(user_record['id'])
+    return {"access_token": token, "user": user_record, "status": "success"}
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
-    books = supabase.table("books").select("id, title").execute().data
-    return {"books": books or []}
+    """
+    Returns books in the specific format:
+    { "total_books": X, "books": [...] }
+    """
+    # 1. Fetch all books
+    books_res = supabase.table("books").select("id, title").execute()
+    all_books_data = books_res.data or []
+    
+    results = []
+    for book in all_books_data:
+        # 2. Fetch the image for stage_number 1 (The Thumbnail)
+        img_res = supabase.table("story_stages") \
+            .select("image_url") \
+            .eq("book_id", book["id"]) \
+            .eq("stage_number", 1) \
+            .execute()
+        
+        thumbnail_url = img_res.data[0]["image_url"] if img_res.data else None
+        
+        results.append({
+            "book_id": book["id"], 
+            "title": book["title"], 
+            "thumbnail": thumbnail_url
+        })
+
+    # 3. Construct the response according to the requested format
+    return {
+        "total_books": len(results),
+        "books": results
+    }
+
+@app.get("/session/{book_id}/check")
+async def check_session(book_id: str, user_id: str = Depends(get_current_user)):
+    if book_id == "undefined":
+        raise HTTPException(status_code=400, detail="Invalid Book ID")
+        
+    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
+    return {"has_existing": len(res.data) > 0, "session": res.data[0] if res.data else None}
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest, user_id: str = Depends(get_current_user)):
-    updated_context = (req.story_context or "") + f" | AUTHOR INPUT: {req.user_input}"
+async def chat(req: dict = Body(...), user_id: str = Depends(get_current_user)):
+    user_input = req.get("user_input")
+    context = (req.get("story_context") or "") + f" | AUTHOR INPUT: {user_input}"
     
-    stages_res = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute()
-    stages_map = {s['stage_number']: s for s in (stages_res.data or [])}
-    
-    curr = stages_map.get(req.current_stage)
-    if not curr:
-        raise HTTPException(status_code=404, detail="Stage not found")
-        
     prompt = f"""
     You are Story Buddy (gemini-3-flash-preview). 
-    The user is the AUTHOR. 
-    Context: {updated_context}
-    Stage Theme: {curr['theme']}
-    
-    Rules:
-    - Never call the user by character names.
-    - Ask what is in their picture.
-    - End with [STAY] or [ADVANCE].
+    User is the Author. 
+    Context: {context}
+    Rules: Never address them by character names. Nudge them to describe their drawing.
+    End with [STAY] or [ADVANCE].
     """
     
     ai_res = model.generate_content(prompt).text
-    should_adv = "[ADVANCE]" in ai_res
-    clean_reply = ai_res.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
-
     return {
-        "reply": clean_reply,
-        "current_stage": req.current_stage + 1 if should_adv else req.current_stage,
-        "action": "ADVANCE" if should_adv else "STAY",
-        "story_context": updated_context
+        "reply": ai_res.replace("[ADVANCE]", "").replace("[STAY]", "").strip(),
+        "action": "ADVANCE" if "[ADVANCE]" in ai_res else "STAY",
+        "story_context": context
     }
 
 if __name__ == "__main__":
