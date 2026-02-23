@@ -183,7 +183,7 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     
     KID-FRIENDLY RULES:
     1. Use very simple English. Be encouraging and use words like 'Wow!', 'Yay!', and 'Great job!'.
-    2. NEVER mention "drawings" or "drawing". Refer to the "pictures in the book" or the "illustration".
+    2. NEVER mention "drawings" or "drawing". Refer to the "images in the book".
     3. Acknowledge details the child gives immediately.
     4. Ask the author to find a hint in the picture regarding: {curr['theme']}.
     5. Always nudge the child to confirm if they have written this part in their book template.
@@ -224,3 +224,4 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
