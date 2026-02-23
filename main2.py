@@ -1,9 +1,9 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Creative Coach Mode")
+app = FastAPI(title="Story Buddy API - Final Sync")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -55,11 +55,12 @@ class ChatRequest(BaseModel):
     story_context: Optional[str] = ""
     book_id: str
     session_id: str
+    history: List[dict] = [] 
 
 class SessionActionRequest(BaseModel):
     archive_existing: bool = False
 
-# --- 4. BACKGROUND TASKS (ASYNC LOGGING) ---
+# --- 4. BACKGROUND TASKS ---
 def log_to_db(session_id: str, user_id: str, role: str, content: str):
     try:
         supabase.table("chat_messages").insert({
@@ -94,30 +95,40 @@ async def get_current_user(authorization: str = Header(None)):
 @app.post("/auth/login")
 async def auth_login(payload: dict):
     token = payload.get("credential")
-    idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+    id_info = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+    
     user_data = {
-        "email": idinfo['email'],
-        "name": idinfo.get('name'),
-        "avatar_url": idinfo.get('picture'),
-        "last_login": datetime.utcnow().isoformat()
+        "email": id_info['email'],
+        "name": id_info.get('name'),
+        "avatar_url": id_info.get('picture'),
+        "last_login": datetime.now(timezone.utc).isoformat()
     }
+    
     res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
     user_record = res.data[0]
+    
+    # Matching your exact successful response structure
     access_token = jwt.encode({"user_id": user_record['id']}, JWT_SECRET, algorithm=ALGORITHM)
-    return {"token": access_token, "user": user_record}
+    
+    return {
+        "access_token": access_token,
+        "user": user_record,
+        "status": "success"
+    }
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
-    books = supabase.table("books").select("id, title").execute().data
+    books_res = supabase.table("books").select("id, title").execute()
+    all_books_data = books_res.data or []
     results = []
-    for b in books:
-        img = supabase.table("story_stages").select("image_url").eq("book_id", b["id"]).eq("stage_number", 1).execute().data
+    for book in all_books_data:
+        img_res = supabase.table("story_stages").select("image_url").eq("book_id", book["id"]).eq("stage_number", 1).execute()
         results.append({
-            "book_id": b["id"], 
-            "title": b["title"], 
-            "thumbnail": img[0]["image_url"] if img else None
+            "book_id": book["id"], 
+            "title": book["title"], 
+            "thumbnail": img_res.data[0]["image_url"] if img_res.data else None
         })
-    return {"books": results}
+    return {"total_books": len(results), "books": results}
 
 @app.get("/session/{book_id}/check")
 async def check_session(book_id: str, user_id: str = Depends(get_current_user)):
@@ -150,7 +161,7 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
     return {
         "reply": welcome_msg, 
         "session": session, 
-        "image_url": stage['image_url'], 
+        "image_url": stage['image_url'] if stage else None, 
         "recent_history": recent_messages
     }
 
@@ -159,30 +170,32 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
     updated_context = (req.story_context or "") + f" | Child: {req.user_input}"
-    stages = supabase.table("supabase_story_stages" if "supabase_story_stages" in globals() else "story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
+    stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # NEW COACH PROMPT: Focuses on child-led writing and image nudging
-    prompt = f"""
+    system_instruction = f"""
     You are Story Buddy, a magical creative coach for a child author. 
-    Context so far: {updated_context}
-    Current Stage Goal: {curr['theme']}
+    Context: {updated_context}
+    Stage Theme: {curr['theme']}
     
     COACHING RULES:
-    1. DO NOT write the story narrative yourself. The child must lead.
-    2. ACKNOWLEDGE: Warmly repeat the details the child just gave (e.g., if they provided names like Bala and Dhiaan, use them immediately and DO NOT ask for them again).
-    3. NUDGE: Encourage the child to look at their story sheet/image. Ask them to describe what they see happening there or where the characters are going.
-    4. SUPPORT: Only provide sample story sentences if the child says "I'm stuck," "help me," or "I don't know."
-    5. INTERACTION: End every message with a curious question about the characters' next move or their surroundings.
-    6. PROGRESS: If the child has contributed 3 meaningful turns in this stage, include [ADVANCE]. Otherwise, include [STAY].
-    
-    Tone: Encouraging, simple (5-8 year old level), and inquisitive.
+    1. DO NOT write the story narrative yourself. 
+    2. ACKNOWLEDGE: Use details the child gives (e.g., names Bala and Dhiaan) immediately.
+    3. NUDGE: Ask them to describe their drawing or what the characters are doing.
+    4. INTERACTION: End with a curious question.
+    5. PROGRESS: If they contributed 3 turns, include [ADVANCE]. Otherwise, include [STAY].
     """
+
+    messages = [{"role": "user", "parts": [system_instruction]}]
+    for msg in req.history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        messages.append({"role": role, "parts": [msg["content"]]})
+    messages.append({"role": "user", "parts": [req.user_input]})
     
-    ai_res_raw = model.generate_content(prompt).text
+    ai_res_raw = model.generate_content(messages).text
     
     should_adv = "[ADVANCE]" in ai_res_raw and nxt
     new_stage = req.current_stage + 1 if should_adv else req.current_stage
@@ -200,11 +213,6 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
         "action": "ADVANCE" if should_adv else "STAY",
         "story_context": updated_context
     }
-
-@app.get("/session/{session_id}/history")
-async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depends(get_current_user)):
-    res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session_id).order("created_at", desc=True).range(offset, offset + 10).execute()
-    return {"history": res.data}
 
 if __name__ == "__main__":
     import uvicorn
