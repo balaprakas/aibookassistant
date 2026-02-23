@@ -1,9 +1,9 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
@@ -23,6 +23,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 JWT_SECRET = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 
+# Token Lifetimes
+ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
+REFRESH_TOKEN_EXPIRE_DAYS = 30    # 30 days
+
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
@@ -31,7 +35,6 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- 2. CORS CONFIGURATION ---
-# Added all your current deployment origins to ensure the pre-flight OPTIONS request passes
 origins = [
     "https://accessible-aili-untoldstories-da4d51c9.lovable.app",
     "http://localhost:5173",
@@ -60,7 +63,37 @@ class ChatRequest(BaseModel):
 class SessionActionRequest(BaseModel):
     archive_existing: bool = False
 
-# --- 4. BACKGROUND TASKS ---
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+# --- 4. AUTH HELPERS ---
+
+def create_access_token(user_id: str):
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode = {"user_id": user_id, "exp": expire, "type": "access"}
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+
+def create_refresh_token(user_id: str):
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode = {"user_id": user_id, "exp": expire, "type": "refresh"}
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
+
+async def get_current_user(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user_id = payload.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        return user_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Session expired or invalid")
+
+# --- 5. BACKGROUND TASKS ---
 def log_to_db(session_id: str, user_id: str, role: str, content: str):
     try:
         supabase.table("chat_messages").insert({
@@ -79,18 +112,11 @@ def update_session_state(session_id: str, stage: int, turns: int, context: str):
     except Exception as e:
         print(f"Session Update Error: {e}")
 
-# --- 5. AUTH HELPERS ---
-async def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    token = authorization.split(" ")[1]
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        return payload.get("user_id")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid session")
-
 # --- 6. ENDPOINTS ---
+
+@app.get("/")
+async def root():
+    return {"status": "Story Buddy API is active"}
 
 @app.post("/auth/login")
 async def auth_login(payload: dict):
@@ -104,20 +130,34 @@ async def auth_login(payload: dict):
             "email": idinfo['email'],
             "name": idinfo.get('name'),
             "avatar_url": idinfo.get('picture'),
-            "last_login": datetime.utcnow().isoformat()
+            "last_login": datetime.now(timezone.utc).isoformat()
         }
-        # Upsert user into DB
+        
+        # Sync with DB
         res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
         user_record = res.data[0]
-        access_token = create_access_token({"user_id": user_record['id']})
-        return {"token": access_token, "user": user_record}
+        
+        user_id_str = str(user_record['id'])
+        return {
+            "access_token": create_access_token(user_id_str),
+            "refresh_token": create_refresh_token(user_id_str),
+            "user": user_record
+        }
     except Exception as e:
         print(f"Auth error: {e}")
         raise HTTPException(status_code=401, detail="Google Auth Failed")
 
-@app.get("/")
-async def root():
-    return {"status": "Story Buddy API is active"}
+@app.post("/auth/refresh")
+async def refresh_token_endpoint(req: RefreshRequest):
+    try:
+        payload = jwt.decode(req.refresh_token, JWT_SECRET, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        
+        user_id = payload.get("user_id")
+        return {"access_token": create_access_token(user_id)}
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Refresh token expired or invalid")
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
@@ -139,13 +179,12 @@ async def check_session(book_id: str, user_id: str = Depends(get_current_user)):
 
 @app.post("/session/{book_id}/start")
 async def start_session(book_id: str, req: SessionActionRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
-    # Archive if requested
     if req.archive_existing:
         supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
     
-    # Check for active session
     res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
-    book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
+    book_res = supabase.table("books").select("*").eq("id", book_id).single().execute()
+    book = book_res.data
     
     if not book:
         raise HTTPException(status_code=404, detail="Book not found")
@@ -156,7 +195,6 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
         recent_messages = msg_res.data[::-1]
         welcome_msg = "Welcome back! Ready to continue our story?"
     else:
-        # Create new session
         session = supabase.table("sessions").insert({
             "user_id": user_id, "book_id": book_id, "current_stage": 1, "stage_turn_count": 0, "story_context": f"Book: {book['title']}"
         }).execute().data[0]
@@ -164,7 +202,6 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
         recent_messages = []
         background_tasks.add_task(log_to_db, session["id"], user_id, "assistant", welcome_msg)
 
-    # Fetch initial stage image
     stage = supabase.table("story_stages").select("*").eq("book_id", book_id).eq("stage_number", session['current_stage']).single().execute().data
     
     return {
@@ -178,29 +215,29 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
     background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
 
-    # Label input as AUTHOR to separate from CHARACTERS
     updated_context = (req.story_context or "") + f" | AUTHOR INPUT: {req.user_input}"
     
     stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
     stages_map = {s['stage_number']: s for s in stages}
     
-    curr = stages_map[req.current_stage]
+    curr = stages_map.get(req.current_stage)
+    if not curr:
+        raise HTTPException(status_code=404, detail="Current stage context missing")
+        
     nxt = stages_map.get(req.current_stage + 1)
     
     prompt = f"""
-    You are Story Buddy, a magical co-author coach for a child author. the kids use this system to get help in writing their stories. they are provided with a story book templates with placeholders to write stories and use the images at the back of the book to 
-    write their stories. the kid will come to this system to get help in proceeding with the story. 
-    
+    You are Story Buddy, a magical co-author coach for a child author. 
     FULL STORY CONTEXT: {updated_context}
     CURRENT STAGE THEME: {curr['theme']}
     NEXT STAGE THEME: {nxt['theme'] if nxt else 'The End'}
     
     STRICT OPERATING RULES:
-    1. THE USER IS THE AUTHOR: Never address the author by character names (like Bala or Dhiaan). They are the creator.
-    2. NAMES ARE DYNAMIC: Identify the names provided for the characters and use them to talk ABOUT the story.
-    3. IMAGE NUDGING: Your goal is to get the author to look at their drawing or story sheet. Ask: "Looking at your picture, what are [Characters] doing?"
-    4. NO AUTO-WRITING: Do not write the story for them. If they are stuck, give ONE tiny suggestion.
-    5. PROGRESS: If the author has provided enough detail for this stage (usually 3 turns), include [ADVANCE]. Otherwise, [STAY].
+    1. THE USER IS THE AUTHOR: Never address the author by character names.
+    2. NAMES ARE DYNAMIC: talk ABOUT the story characters.
+    3. IMAGE NUDGING: Ask: "Looking at your picture, what are [Characters] doing?"
+    4. NO AUTO-WRITING: Do not write the story for them. Give ONE tiny suggestion if stuck.
+    5. PROGRESS: If the author has provided enough detail (usually turn {req.stage_turn_count + 1} >= 3), include [ADVANCE]. Otherwise, [STAY].
     
     Tone: 2-3 enchanting sentences.
     End with [STAY] or [ADVANCE].
@@ -233,5 +270,3 @@ async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depe
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
