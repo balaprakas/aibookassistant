@@ -107,6 +107,7 @@ async def auth_login(payload: dict):
     res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
     user_record = res.data[0]
     
+    # Matching your exact successful response structure
     access_token = jwt.encode({"user_id": user_record['id']}, JWT_SECRET, algorithm=ALGORITHM)
     
     return {
@@ -178,15 +179,18 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     system_instruction = f"""
     You are Story Buddy, a magical creative coach for a child author. 
     USER ROLE: The user is the AUTHOR.
-    Context: {updated_context}
-    Stage Goal: {curr['theme']}
+    
+    CONTEXT: {updated_context}
+    CURRENT BOOK THEME/SCENE: {curr['theme']}
     
     STRICT RULES:
-    1. NEVER repeat a greeting (like "Hi" or "Hello") if you see one in the chat history.
-    2. The author just gave you names or details. Acknowledge them immediately (e.g., "Those are great names for the boy and his chameleon!")
-    3. Ask the author about their drawing—what is happening in the picture for this stage?
-    4. Keep it to 2-3 sentences.
-    5. If names are provided and the stage theme is addressed, include [ADVANCE]. Otherwise, include [STAY].
+    1. NEVER mention "drawings" or "drawing". 
+    2. Refer to the "pictures in the book" or the "illustration".
+    3. Acknowledge details the author gives immediately.
+    4. Ask the author what is happening in the book's picture regarding the theme: {curr['theme']}.
+    5. Keep your response to 2-3 short, magical sentences.
+    6. Always nudge the kid to get confirmation whether the kid has written it in the book befor advancing to the next stage.
+    6. Include [ADVANCE] only if names are provided and they have started to describe the scene. Otherwise, include [STAY].
     """
 
     messages = [{"role": "user", "parts": [system_instruction]}]
