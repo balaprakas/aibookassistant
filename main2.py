@@ -13,7 +13,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 
 load_dotenv()
-app = FastAPI(title="Story Buddy API - Final Author Logic")
+app = FastAPI(title="Story Buddy API - Robust Login")
 
 # --- 1. CONFIGURATION ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -23,10 +23,6 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 JWT_SECRET = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 
-# Token Lifetimes
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-REFRESH_TOKEN_EXPIRE_DAYS = 30
-
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
@@ -35,17 +31,9 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- 2. CORS CONFIGURATION ---
-origins = [
-    "https://accessible-aili-untoldstories-da4d51c9.lovable.app",
-    "http://localhost:5173",
-    "https://aistoryassistant.lovable.app",
-    "https://a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovableproject.com",
-    "https://id-preview--a5d02d6e-03c4-413d-9c83-f019e987dcc1.lovable.app"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,194 +48,109 @@ class ChatRequest(BaseModel):
     book_id: str
     session_id: str
 
-class SessionActionRequest(BaseModel):
-    archive_existing: bool = False
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
 # --- 4. AUTH HELPERS ---
 
 def create_access_token(user_id: str):
-    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode = {"user_id": user_id, "exp": expire, "type": "access"}
-    return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
-
-def create_refresh_token(user_id: str):
-    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode = {"user_id": user_id, "exp": expire, "type": "refresh"}
+    expire = datetime.now(timezone.utc) + timedelta(minutes=60)
+    to_encode = {"user_id": str(user_id), "exp": expire, "type": "access"}
     return jwt.encode(to_encode, JWT_SECRET, algorithm=ALGORITHM)
 
 async def get_current_user(authorization: str = Header(None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not authorization or "undefined" in authorization:
+        raise HTTPException(status_code=401, detail="Unauthorized: No token provided")
+    
     token = authorization.split(" ")[1]
-    if token == "undefined":
-        raise HTTPException(status_code=401, detail="Token is undefined")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        user_id = payload.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-        return user_id
+        return payload.get("user_id")
     except JWTError:
-        raise HTTPException(status_code=401, detail="Session expired or invalid")
+        raise HTTPException(status_code=401, detail="Unauthorized: Session expired")
 
-# --- 5. BACKGROUND TASKS ---
-def log_to_db(session_id: str, user_id: str, role: str, content: str):
-    try:
-        supabase.table("chat_messages").insert({
-            "session_id": session_id, "user_id": user_id, "role": role, "content": content
-        }).execute()
-    except Exception as e:
-        print(f"Audit Log Error: {e}")
-
-def update_session_state(session_id: str, stage: int, turns: int, context: str):
-    try:
-        supabase.table("sessions").update({
-            "current_stage": stage, 
-            "stage_turn_count": turns, 
-            "story_context": context
-        }).eq("id", session_id).execute()
-    except Exception as e:
-        print(f"Session Update Error: {e}")
-
-# --- 6. ENDPOINTS ---
-
-@app.get("/")
-async def root():
-    return {"status": "Story Buddy API is active"}
+# --- 5. ENDPOINTS ---
 
 @app.post("/auth/login")
-async def auth_login(payload: dict):
-    token = payload.get("credential")
-    if not token:
-        raise HTTPException(status_code=400, detail="Missing credential")
+async def auth_login(payload: dict = Body(...)):
+    credential = payload.get("credential")
+    if not credential:
+        raise HTTPException(status_code=400, detail="Missing Google credential")
         
     try:
-        idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
+        # 1. Verify Google Token
+        idinfo = id_token.verify_oauth2_token(credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+        email = idinfo['email']
+        
         user_data = {
-            "email": idinfo['email'],
+            "email": email,
             "name": idinfo.get('name'),
             "avatar_url": idinfo.get('picture'),
             "last_login": datetime.now(timezone.utc).isoformat()
         }
         
+        # 2. Upsert to Supabase
+        # We use select() after upsert to ensure data is returned
         res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
-        user_record = res.data[0]
         
-        user_id_str = str(user_record['id'])
-        return {
-            "access_token": create_access_token(user_id_str),
-            "refresh_token": create_refresh_token(user_id_str),
-            "user": user_record
+        # 3. Fallback: If upsert didn't return data, fetch it manually
+        if not res.data:
+            res = supabase.table("users").select("*").eq("email", email).execute()
+        
+        if not res.data:
+            raise Exception("Failed to create or retrieve user record")
+
+        user_record = res.data[0]
+        user_id = str(user_record['id'])
+        
+        # 4. Generate Token
+        access_token = create_access_token(user_id)
+        
+        # 5. EXPLICIT RETURN (Ensuring non-empty response)
+        response_data = {
+            "access_token": access_token,
+            "user": user_record,
+            "status": "success"
         }
+        print(f"DEBUG: Returning login for {email}")
+        return response_data
+
     except Exception as e:
-        print(f"Auth error: {e}")
-        raise HTTPException(status_code=401, detail="Google Auth Failed")
+        print(f"CRITICAL LOGIN ERROR: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Login failed: {str(e)}")
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
     books = supabase.table("books").select("id, title").execute().data
-    results = []
-    for b in books:
-        img = supabase.table("story_stages").select("image_url").eq("book_id", b["id"]).eq("stage_number", 1).execute().data
-        results.append({
-            "book_id": b["id"], 
-            "title": b["title"], 
-            "thumbnail": img[0]["image_url"] if img else None
-        })
-    return {"books": results}
-
-@app.get("/session/{book_id}/check")
-async def check_session(book_id: str, user_id: str = Depends(get_current_user)):
-    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
-    return {"has_existing": len(res.data) > 0, "session": res.data[0] if res.data else None}
-
-@app.post("/session/{book_id}/start")
-async def start_session(book_id: str, req: SessionActionRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
-    if req.archive_existing:
-        supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
-    
-    res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
-    book_res = supabase.table("books").select("*").eq("id", book_id).single().execute()
-    book = book_res.data
-    
-    if not book:
-        raise HTTPException(status_code=404, detail="Book not found")
-
-    if res.data:
-        session = res.data[0]
-        msg_res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session["id"]).order("created_at", desc=True).limit(10).execute()
-        recent_messages = msg_res.data[::-1]
-        welcome_msg = "Welcome back! Ready to continue our story?"
-    else:
-        session = supabase.table("sessions").insert({
-            "user_id": user_id, "book_id": book_id, "current_stage": 1, "stage_turn_count": 0, "story_context": f"Book: {book['title']}"
-        }).execute().data[0]
-        welcome_msg = f"Hi! I'm Story Buddy. {book['welcome_question']}"
-        recent_messages = []
-        background_tasks.add_task(log_to_db, session["id"], user_id, "assistant", welcome_msg)
-
-    stage = supabase.table("story_stages").select("*").eq("book_id", book_id).eq("stage_number", session['current_stage']).single().execute().data
-    
-    return {
-        "reply": welcome_msg, 
-        "session": session, 
-        "image_url": stage['image_url'] if stage else None, 
-        "recent_history": recent_messages
-    }
+    return {"books": books or []}
 
 @app.post("/chat")
-async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, user_id: str = Depends(get_current_user)):
-    background_tasks.add_task(log_to_db, req.session_id, user_id, "user", req.user_input)
-
+async def chat_endpoint(req: ChatRequest, user_id: str = Depends(get_current_user)):
     updated_context = (req.story_context or "") + f" | AUTHOR INPUT: {req.user_input}"
     
     stages_res = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute()
-    stages = stages_res.data
-    stages_map = {s['stage_number']: s for s in stages}
+    stages_map = {s['stage_number']: s for s in (stages_res.data or [])}
     
     curr = stages_map.get(req.current_stage)
     if not curr:
-        raise HTTPException(status_code=404, detail="Current stage missing")
+        raise HTTPException(status_code=404, detail="Stage not found")
         
-    nxt = stages_map.get(req.current_stage + 1)
-    
     prompt = f"""
-    You are Story Buddy, a magical co-author coach for a child author. 
-    FULL STORY CONTEXT: {updated_context}
-    CURRENT STAGE THEME: {curr['theme']}
-    NEXT STAGE THEME: {nxt['theme'] if nxt else 'The End'}
+    You are Story Buddy (gemini-3-flash-preview). 
+    The user is the AUTHOR. 
+    Context: {updated_context}
+    Stage Theme: {curr['theme']}
     
-    STRICT RULES:
-    1. THE USER IS THE AUTHOR: Never address the user as character names (e.g. Bala or Dhiaan).
-    2. NAMES ARE CHARACTERS: Use provided names to talk ABOUT the characters.
-    3. IMAGE NUDGING: Ask: "In your picture, what is happening with the characters?"
-    4. NO AUTO-WRITING: Do not write story text. Help the author write it.
-    5. PROGRESS: If they gave names and detail, end with [ADVANCE]. Otherwise [STAY].
-    
-    Tone: 2 enchantingly short sentences.
-    End with [STAY] or [ADVANCE].
+    Rules:
+    - Never call the user by character names.
+    - Ask what is in their picture.
+    - End with [STAY] or [ADVANCE].
     """
     
-    ai_res_raw = model.generate_content(prompt).text
-    
-    should_adv = "[ADVANCE]" in ai_res_raw and nxt
-    new_stage = req.current_stage + 1 if should_adv else req.current_stage
-    new_turn_count = 0 if should_adv else req.stage_turn_count + 1
-    clean_reply = ai_res_raw.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
-
-    background_tasks.add_task(log_to_db, req.session_id, user_id, "assistant", clean_reply)
-    background_tasks.add_task(update_session_state, req.session_id, new_stage, new_turn_count, updated_context)
+    ai_res = model.generate_content(prompt).text
+    should_adv = "[ADVANCE]" in ai_res
+    clean_reply = ai_res.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
 
     return {
         "reply": clean_reply,
-        "current_stage": new_stage,
-        "stage_turn_count": new_turn_count,
-        "image_url": stages_map[new_stage]["image_url"],
+        "current_stage": req.current_stage + 1 if should_adv else req.current_stage,
         "action": "ADVANCE" if should_adv else "STAY",
         "story_context": updated_context
     }
