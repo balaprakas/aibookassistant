@@ -107,7 +107,6 @@ async def auth_login(payload: dict):
     res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
     user_record = res.data[0]
     
-    # Matching your exact successful response structure
     access_token = jwt.encode({"user_id": user_record['id']}, JWT_SECRET, algorithm=ALGORITHM)
     
     return {
@@ -178,21 +177,28 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     
     system_instruction = f"""
     You are Story Buddy, a magical creative coach for a child author. 
+    USER ROLE: The user is the AUTHOR.
     Context: {updated_context}
-    Stage Theme: {curr['theme']}
+    Stage Goal: {curr['theme']}
     
-    COACHING RULES:
-    1. DO NOT write the story narrative yourself. 
-    2. ACKNOWLEDGE: Use details the child gives (e.g., names Bala and Dhiaan) immediately.
-    3. NUDGE: Ask them to describe their drawing or what the characters are doing.
-    4. INTERACTION: End with a curious question.
-    5. PROGRESS: If they contributed 3 turns, include [ADVANCE]. Otherwise, include [STAY].
+    STRICT RULES:
+    1. NEVER repeat a greeting (like "Hi" or "Hello") if you see one in the chat history.
+    2. The author just gave you names or details. Acknowledge them immediately (e.g., "Those are great names for the boy and his chameleon!")
+    3. Ask the author about their drawing—what is happening in the picture for this stage?
+    4. Keep it to 2-3 sentences.
+    5. If names are provided and the stage theme is addressed, include [ADVANCE]. Otherwise, include [STAY].
     """
 
     messages = [{"role": "user", "parts": [system_instruction]}]
-    for msg in req.history:
+    
+    # Filter history to avoid duplicates if the frontend sends the current turn in history
+    clean_history = [msg for msg in req.history if msg["content"] != req.user_input]
+    
+    for msg in clean_history:
         role = "model" if msg["role"] == "assistant" else "user"
         messages.append({"role": role, "parts": [msg["content"]]})
+        
+    # Append the actual current turn
     messages.append({"role": "user", "parts": [req.user_input]})
     
     ai_res_raw = model.generate_content(messages).text
@@ -205,11 +211,14 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     background_tasks.add_task(log_to_db, req.session_id, user_id, "assistant", clean_reply)
     background_tasks.add_task(update_session_state, req.session_id, new_stage, new_turn_count, updated_context)
 
+    # Safety check for image URL
+    final_image = stages_map.get(new_stage, {}).get("image_url", curr["image_url"])
+
     return {
         "reply": clean_reply,
         "current_stage": new_stage,
         "stage_turn_count": new_turn_count,
-        "image_url": stages_map[new_stage]["image_url"],
+        "image_url": final_image,
         "action": "ADVANCE" if should_adv else "STAY",
         "story_context": updated_context
     }
