@@ -24,8 +24,8 @@ JWT_SECRET = os.getenv("JWT_SECRET")
 ALGORITHM = "HS256"
 
 # Token Lifetimes
-ACCESS_TOKEN_EXPIRE_MINUTES = 60  # 1 hour
-REFRESH_TOKEN_EXPIRE_DAYS = 30    # 30 days
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -82,6 +82,8 @@ async def get_current_user(authorization: str = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
     token = authorization.split(" ")[1]
+    if token == "undefined":
+        raise HTTPException(status_code=401, detail="Token is undefined")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
         if payload.get("type") != "access":
@@ -133,7 +135,6 @@ async def auth_login(payload: dict):
             "last_login": datetime.now(timezone.utc).isoformat()
         }
         
-        # Sync with DB
         res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
         user_record = res.data[0]
         
@@ -146,18 +147,6 @@ async def auth_login(payload: dict):
     except Exception as e:
         print(f"Auth error: {e}")
         raise HTTPException(status_code=401, detail="Google Auth Failed")
-
-@app.post("/auth/refresh")
-async def refresh_token_endpoint(req: RefreshRequest):
-    try:
-        payload = jwt.decode(req.refresh_token, JWT_SECRET, algorithms=[ALGORITHM])
-        if payload.get("type") != "refresh":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        
-        user_id = payload.get("user_id")
-        return {"access_token": create_access_token(user_id)}
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Refresh token expired or invalid")
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
@@ -217,12 +206,13 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
 
     updated_context = (req.story_context or "") + f" | AUTHOR INPUT: {req.user_input}"
     
-    stages = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute().data
+    stages_res = supabase.table("story_stages").select("*").eq("book_id", req.book_id).order("stage_number").execute()
+    stages = stages_res.data
     stages_map = {s['stage_number']: s for s in stages}
     
     curr = stages_map.get(req.current_stage)
     if not curr:
-        raise HTTPException(status_code=404, detail="Current stage context missing")
+        raise HTTPException(status_code=404, detail="Current stage missing")
         
     nxt = stages_map.get(req.current_stage + 1)
     
@@ -232,14 +222,14 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     CURRENT STAGE THEME: {curr['theme']}
     NEXT STAGE THEME: {nxt['theme'] if nxt else 'The End'}
     
-    STRICT OPERATING RULES:
-    1. THE USER IS THE AUTHOR: Never address the author by character names.
-    2. NAMES ARE DYNAMIC: talk ABOUT the story characters.
-    3. IMAGE NUDGING: Ask: "Looking at your picture, what are [Characters] doing?"
-    4. NO AUTO-WRITING: Do not write the story for them. Give ONE tiny suggestion if stuck.
-    5. PROGRESS: If the author has provided enough detail (usually turn {req.stage_turn_count + 1} >= 3), include [ADVANCE]. Otherwise, [STAY].
+    STRICT RULES:
+    1. THE USER IS THE AUTHOR: Never address the user as character names (e.g. Bala or Dhiaan).
+    2. NAMES ARE CHARACTERS: Use provided names to talk ABOUT the characters.
+    3. IMAGE NUDGING: Ask: "In your picture, what is happening with the characters?"
+    4. NO AUTO-WRITING: Do not write story text. Help the author write it.
+    5. PROGRESS: If they gave names and detail, end with [ADVANCE]. Otherwise [STAY].
     
-    Tone: 2-3 enchanting sentences.
+    Tone: 2 enchantingly short sentences.
     End with [STAY] or [ADVANCE].
     """
     
@@ -261,11 +251,6 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
         "action": "ADVANCE" if should_adv else "STAY",
         "story_context": updated_context
     }
-
-@app.get("/session/{session_id}/history")
-async def get_full_history(session_id: str, offset: int = 0, user_id: str = Depends(get_current_user)):
-    res = supabase.table("chat_messages").select("role, content, created_at").eq("session_id", session_id).order("created_at", desc=True).range(offset, offset + 10).execute()
-    return {"history": res.data}
 
 if __name__ == "__main__":
     import uvicorn
