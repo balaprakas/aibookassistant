@@ -26,8 +26,6 @@ ALGORITHM = "HS256"
 # Initialize Clients
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 genai.configure(api_key=GEMINI_API_KEY)
-
-# STRICT MODEL LOCK: gemini-3-flash-preview
 model = genai.GenerativeModel("gemini-3-flash-preview")
 
 # --- 2. CORS CONFIGURATION ---
@@ -96,24 +94,16 @@ async def get_current_user(authorization: str = Header(None)):
 async def auth_login(payload: dict):
     token = payload.get("credential")
     id_info = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
-    
     user_data = {
         "email": id_info['email'],
         "name": id_info.get('name'),
         "avatar_url": id_info.get('picture'),
         "last_login": datetime.now(timezone.utc).isoformat()
     }
-    
     res = supabase.table("users").upsert(user_data, on_conflict="email").execute()
     user_record = res.data[0]
-    
     access_token = jwt.encode({"user_id": user_record['id']}, JWT_SECRET, algorithm=ALGORITHM)
-    
-    return {
-        "access_token": access_token,
-        "user": user_record,
-        "status": "success"
-    }
+    return {"access_token": access_token, "user": user_record, "status": "success"}
 
 @app.get("/books")
 async def get_all_books(user_id: str = Depends(get_current_user)):
@@ -140,7 +130,8 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
         supabase.table("sessions").update({"is_archived": True}).eq("user_id", user_id).eq("book_id", book_id).execute()
     
     res = supabase.table("sessions").select("*").eq("user_id", user_id).eq("book_id", book_id).eq("is_archived", False).execute()
-    book = supabase.table("books").select("*").eq("id", book_id).single().execute().data
+    book_data_res = supabase.table("books").select("*").eq("id", book_id).single().execute()
+    book = book_data_res.data
     
     if res.data:
         session = res.data[0]
@@ -155,7 +146,8 @@ async def start_session(book_id: str, req: SessionActionRequest, background_task
         recent_messages = []
         background_tasks.add_task(log_to_db, session["id"], user_id, "assistant", welcome_msg)
 
-    stage = supabase.table("story_stages").select("*").eq("book_id", book_id).eq("stage_number", session['current_stage']).single().execute().data
+    stage_data_res = supabase.table("story_stages").select("*").eq("book_id", book_id).eq("stage_number", session['current_stage']).single().execute()
+    stage = stage_data_res.data
     
     return {
         "reply": welcome_msg, 
@@ -175,39 +167,44 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
+    # PASS 1: Evaluate current stage response
     system_instruction = f"""
-    You are 'Story Buddy', a magical and kind friend for a child author.
+    You are 'Story Buddy', a magical, silly, and very kind friend for a child author.
     
     CONTEXT: {updated_context}
     CURRENT THEME: {curr['theme']}
-    STAGE TURNS: {req.stage_turn_count}
     
     KID-FRIENDLY RULES:
-    1. Use simple English and be very encouraging (e.g., "Yay!", "Great job!").
-    2. Reference the "images in the book" regarding: {curr['theme']}.
-    3. If the brainstorming for this part is finished (usually after 2 turns), ask: "Tell me when you have written this part in your template!"
-    4. ADVANCING LOGIC:
-       - Only include [ADVANCE] if the child confirms they finished writing (e.g. "I wrote it", "done", "yes").
-       - If they say "no" or "not yet", give a friendly nudge and include [STAY].
-       - If still brainstorming details, include [STAY].
-    5. Keep responses short (2-3 sentences).
+    1. Use very simple English. Be encouraging ("Yay!", "Great job!").
+    2. Reference the "images in the book" for the theme: {curr['theme']}.
+    3. If brainstorming is done (2+ turns), ask: "Tell me when you have written this part in your template!"
+    4. ADVANCING: 
+       - Include [ADVANCE] ONLY if the child confirms they finished writing (e.g. "done", "yes", "i wrote it").
+       - Otherwise, include [STAY].
+    5. Keep response to 2 short sentences.
     """
 
     messages = [{"role": "user", "parts": [system_instruction]}]
     clean_history = [msg for msg in req.history if msg["content"] != req.user_input]
-    
     for msg in clean_history:
         role = "model" if msg["role"] == "assistant" else "user"
         messages.append({"role": role, "parts": [msg["content"]]})
-        
     messages.append({"role": "user", "parts": [req.user_input]})
     
     ai_res_raw = model.generate_content(messages).text
     
     should_adv = "[ADVANCE]" in ai_res_raw and nxt
+    clean_reply = ai_res_raw.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
+
+    # PASS 2: If advancing, get the next stage's question immediately
+    if should_adv:
+        next_theme = nxt['theme']
+        next_prompt = f"The child just finished the previous page. Now we are on a new page with the theme: '{next_theme}'. Give a 1-sentence excited celebration, then ask a simple question about what they see in the new image for this theme."
+        next_res = model.generate_content(next_prompt).text
+        clean_reply = f"Yay! You did a wonderful job. {next_res.strip()}"
+
     new_stage = req.current_stage + 1 if should_adv else req.current_stage
     new_turn_count = 0 if should_adv else req.stage_turn_count + 1
-    clean_reply = ai_res_raw.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
 
     background_tasks.add_task(log_to_db, req.session_id, user_id, "assistant", clean_reply)
     background_tasks.add_task(update_session_state, req.session_id, new_stage, new_turn_count, updated_context)
