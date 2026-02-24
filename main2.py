@@ -169,7 +169,7 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     curr = stages_map[req.current_stage]
     nxt = stages_map.get(req.current_stage + 1)
     
-    # REFINED PROMPT: Focused on turn-based co-authoring
+    # REFINED PROMPT: Added logic to prevent repeating name questions
     system_instruction = f"""
     You are 'Story Buddy', a magical, silly, and very kind friend for a child author.
     
@@ -179,25 +179,31 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     
     CO-AUTHORING RULES:
     1. BRAINSTORMING (Turns 0-2): Be very curious about the scene details! 
-       - Ask about character clothes, actions, names, or colors in the current image.
-       - NEVER ask the child to "write" in the physical template yet.
-       - ALWAYS include [STAY] at the end of your response.
-    2. WRITING PHASE (Turn 3+): Transition the child to the physical task.
+       - If the child just gave you names (like in CONTEXT), ACKNOWLEDGE THEM and ask a different question about what they see in the image (clothes, actions, colors).
+       - NEVER ask for the names again if they are already provided.
+       - NEVER ask the child to "write" yet.
+       - ALWAYS include [STAY] at the end.
+    2. WRITING PHASE (Turn 3+): Transition to the physical task.
        - Say: "Wow! Tell me when you have written this part in your template!"
-       - Include [ADVANCE] ONLY if the child explicitly confirms they are finished (e.g., "done", "yes", "i wrote it").
+       - Include [ADVANCE] ONLY if the child confirms they are finished.
        - Otherwise, include [STAY].
-    3. STYLE: Use simple, excited English. Maximum 2 short sentences. No long storytelling.
+    3. STYLE: Use simple, excited English. Max 2 short sentences.
     """
 
     # Format history for Gemini API
     history_for_genai = []
+    
+    # --- CHANGE: INJECT SYSTEM INSTRUCTIONS AT THE START ---
+    history_for_genai.append({"role": "user", "parts": [f"System Instructions: {system_instruction}"]})
+    history_for_genai.append({"role": "model", "parts": ["Understood! I am ready to help the child author following these rules."]})
+
+    # Add the actual conversation history
     clean_history = [msg for msg in req.history if msg["content"] != req.user_input]
     for msg in clean_history:
         role = "model" if msg["role"] == "assistant" else "user"
         history_for_genai.append({"role": role, "parts": [msg["content"]]})
     
-    # Add system guide for the current turn
-    history_for_genai.append({"role": "user", "parts": [f"System Instructions: {system_instruction}"]})
+    # Add the child's latest response at the end
     history_for_genai.append({"role": "user", "parts": [req.user_input]})
     
     ai_res_raw = model.generate_content(history_for_genai).text
@@ -205,7 +211,6 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks, use
     should_adv = "[ADVANCE]" in ai_res_raw and nxt
     clean_reply = ai_res_raw.replace("[ADVANCE]", "").replace("[STAY]", "").strip()
 
-    # Transition logic for the next scene
     if should_adv:
         next_theme = nxt['theme']
         next_prompt = f"The child finished writing scene '{curr['theme']}'. Now we are on scene: '{next_theme}'. Give a tiny cheer and ask one simple detail question about what they see in the new picture."
